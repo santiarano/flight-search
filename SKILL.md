@@ -103,6 +103,38 @@ python skills/flight-search/scripts/gf_roundtrip.py \
 | 100 | ~20 min |
 | 200 | ~40 min |
 
+## Price Tracking & Cron
+
+When the user requests a flight search, create a tracker config and enable the cron:
+
+1. **Create tracker**: Write config to `skills/flight-search/scripts/tracker_data/active_trackers.json`:
+```json
+{
+  "trackers": [{
+    "id": "sfo-bcn-202603251200",
+    "origin": "SFO", "dest": "BCN",
+    "out_start": "2026-04-20", "out_end": "2026-05-16",
+    "ret_start": "2026-06-28", "ret_end": "2026-07-22",
+    "cabin": "business", "airlines": "United,TAP",
+    "min_stay": 60, "max_stay": 75, "date_step": 3,
+    "active": true, "runs": []
+  }]
+}
+```
+
+2. **Enable cron**: Set the "Flight price tracker" cron job to `enabled: true` in `~/.openclaw/cron/jobs.json` (job ID: `f1a8c2d0-4e7b-4f9a-b3c1-flight-track01`). It runs at 6 AM and 6 PM PT.
+
+3. **Each run**: The tracker searches all date pairs, saves results, compares with previous run, and reports via Telegram:
+   - Price direction (up/down/same)
+   - Best current price and dates
+   - Biggest price drops and rises
+
+4. **Stop tracking**: When user says they purchased the flight, run:
+```bash
+python skills/flight-search/scripts/track_prices.py --stop
+```
+Then set the cron job to `enabled: false`.
+
 ## Additional Tools
 
 ### FlyLevel Direct API

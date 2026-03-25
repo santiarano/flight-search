@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+scripts/gf_data/
+scripts/tracker_data/
+scripts/.flight-search-state.json
+scripts/.level-scrape-progress.json
+*.png

@@ -116,16 +116,16 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
     # Always use google.com with hl=en — localized domains don't parse English queries
     # The currency param + browser locale/geo are what affect pricing
     url = f"https://www.google.com/travel/flights?q={q.replace(' ', '+')}&curr={currency}&hl=en"
-    page.goto(url, timeout=30000)
-    human_delay(5, 9)
+    page.goto(url, timeout=45000)
+    human_delay(6, 10)
 
     # Scroll to load more
     page.mouse.wheel(0, 500)
-    human_delay(1, 2)
+    human_delay(2, 3)
 
     # Try to expand "Other flights"
     try:
-        more = page.locator('button:has-text("more flights"), button:has-text("Show more")')
+        more = page.locator('button:has-text("more flights"), button:has-text("Show more"), button:has-text("View more")')
         if more.count() > 0:
             click_el(page, more)
             human_delay(2, 3)
@@ -134,9 +134,9 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
 
     results = []
 
-    # Google Flights round-trip results show the total price
-    # Each result is a li with airline, times, duration, stops, and TOTAL price
-    items = page.locator("li").all()
+    # Google Flights uses li elements in US, but proxy/locale may use different layouts
+    # Try multiple container selectors
+    items = page.locator("li, [role='listitem'], [class*='Rk10dc']").all()
     for item in items:
         text = item.inner_text().strip()
         # Match prices in any currency: $1,234 or 1.234 € or £1,234 or 1 234 €
@@ -212,6 +212,61 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
             "ret_stops": stop_texts[1] if len(stop_texts) >= 2 else "",
             "raw_text": text[:300],
         })
+
+    # Fallback: if no results from li scanning, try parsing the full page body
+    if not results:
+        body = page.inner_text("body")
+        # Look for blocks containing both an airline name and a price
+        # Split body by newlines and look for price lines near airline lines
+        lines = body.split("\n")
+        for i, line in enumerate(lines):
+            line = line.strip()
+            price_m = re.search(r"[$€£]\s*([\d.,\xa0]+)|([\d.,\xa0]+)\s*[$€£]", line)
+            if not price_m:
+                continue
+            raw = (price_m.group(1) or price_m.group(2)).replace("\xa0", "").replace(",", "")
+            # Handle European dot-as-thousands: €4.066 -> 4066
+            if "." in raw and len(raw.split(".")[-1]) == 3:
+                raw = raw.replace(".", "")
+            elif "." in raw and raw.count(".") > 1:
+                raw = raw.replace(".", "")
+            try:
+                price = int(float(raw))
+            except ValueError:
+                continue
+            if price < 100 or price > 100000:
+                continue
+
+            # Search surrounding lines for airline name
+            context = " ".join(lines[max(0, i - 5):i + 3])
+            airlines = AIRLINE_PATTERN.findall(context)
+            if not airlines:
+                continue
+
+            airline_str = ", ".join(dict.fromkeys(airlines))
+            merged = re.findall(r"([A-Z][a-z]+(?:[A-Z][a-z]+)+)", context)
+            for m in merged:
+                parts = re.findall(r"[A-Z][a-z]+", m)
+                if len(parts) >= 2:
+                    airline_str = ", ".join(parts)
+                    break
+
+            times = re.findall(r"\d{1,2}:\d{2}\s*(?:AM|PM)", context)
+            durations = re.findall(r"\d+\s*hr\s*(?:\d+\s*min)?", context)
+            stop_texts = re.findall(r"Nonstop|\d+\s*stop", context, re.I)
+
+            results.append({
+                "airline": airline_str,
+                "total_price": price,
+                "out_departure": times[0] if times else "",
+                "out_arrival": times[1] if len(times) > 1 else "",
+                "ret_departure": times[2] if len(times) > 2 else "",
+                "ret_arrival": times[3] if len(times) > 3 else "",
+                "out_duration": durations[0] if durations else "",
+                "ret_duration": durations[1] if len(durations) > 1 else "",
+                "out_stops": stop_texts[0] if stop_texts else "",
+                "ret_stops": stop_texts[1] if len(stop_texts) > 1 else "",
+            })
 
     # Deduplicate
     seen = set()
@@ -312,6 +367,20 @@ def main():
     currency = args.currency or country["currency"]
     domain = country["domain"]
     currency_symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
+
+    # Auto-find proxy for non-US countries if none provided
+    if args.country != "US" and not args.proxy:
+        try:
+            from find_proxy import get_proxy
+            print(f"Finding a {args.country} proxy...")
+            proxy = get_proxy((args.country,) + ("PT", "FR", "DE"))
+            if proxy:
+                args.proxy = proxy
+                print(f"Using proxy: {proxy}")
+            else:
+                print("No working proxy found — searching with US IP but EU locale/currency")
+        except ImportError:
+            print("find_proxy.py not available — searching without proxy")
 
     with sync_playwright() as pw:
         launch_opts = {

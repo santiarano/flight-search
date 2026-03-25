@@ -23,6 +23,26 @@ SCRIPTS_DIR = Path(__file__).parent
 DATA_DIR = SCRIPTS_DIR / "gf_data"
 VAULT_FLIGHTS = Path(os.path.expanduser("~/clawd/obsidian-vault/flights"))
 
+# Country presets: locale, timezone, google domain, currency, geolocation
+COUNTRY_PRESETS = {
+    "US": {"locale": "en-US", "tz": "America/Los_Angeles", "domain": "google.com", "currency": "USD",
+           "geo": {"latitude": 37.7749, "longitude": -122.4194}},
+    "ES": {"locale": "es-ES", "tz": "Europe/Madrid", "domain": "google.es", "currency": "EUR",
+           "geo": {"latitude": 40.4168, "longitude": -3.7038}},
+    "UK": {"locale": "en-GB", "tz": "Europe/London", "domain": "google.co.uk", "currency": "GBP",
+           "geo": {"latitude": 51.5074, "longitude": -0.1278}},
+    "DE": {"locale": "de-DE", "tz": "Europe/Berlin", "domain": "google.de", "currency": "EUR",
+           "geo": {"latitude": 52.5200, "longitude": 13.4050}},
+    "FR": {"locale": "fr-FR", "tz": "Europe/Paris", "domain": "google.fr", "currency": "EUR",
+           "geo": {"latitude": 48.8566, "longitude": 2.3522}},
+    "MX": {"locale": "es-MX", "tz": "America/Mexico_City", "domain": "google.com.mx", "currency": "MXN",
+           "geo": {"latitude": 19.4326, "longitude": -99.1332}},
+    "BR": {"locale": "pt-BR", "tz": "America/Sao_Paulo", "domain": "google.com.br", "currency": "BRL",
+           "geo": {"latitude": -23.5505, "longitude": -46.6333}},
+    "JP": {"locale": "ja-JP", "tz": "Asia/Tokyo", "domain": "google.co.jp", "currency": "JPY",
+           "geo": {"latitude": 35.6762, "longitude": 139.6503}},
+}
+
 AIRLINE_PATTERN = re.compile(
     r"(United(?:Lufthansa)?|United|TAP|Tap Air Portugal|LEVEL|Iberia|American|Delta|"
     r"SWISS|British Airways|Air France|KLM|Lufthansa|LOT|Aer Lingus|Finnair|Turkish|Norse|"
@@ -55,6 +75,13 @@ def parse_args():
     p.add_argument("--csv", default=None)
     p.add_argument("--html", default=None)
     p.add_argument("--json-out", default=None)
+    # Country / proxy — for geo-pricing comparison
+    p.add_argument("--country", default="US", choices=list(COUNTRY_PRESETS.keys()),
+                   help="Browse as if from this country (sets locale, timezone, currency)")
+    p.add_argument("--proxy", default=None,
+                   help="HTTP/SOCKS5 proxy (e.g. socks5://1.2.3.4:1080 or http://user:pass@proxy:8080)")
+    p.add_argument("--currency", default=None,
+                   help="Override currency (e.g. EUR, GBP). Default: from --country")
     # Browser
     p.add_argument("--headed", action="store_true")
     p.add_argument("--delay-min", type=float, default=5)
@@ -76,7 +103,8 @@ def click_el(page, locator):
     return False
 
 
-def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=False, debug=False):
+def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=False,
+                     domain="google.com", currency="USD", debug=False):
     """
     Search flights on Google Flights via natural language URL.
     Returns list of result dicts.
@@ -85,7 +113,9 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
         q = f"Flights from {origin} to {dest} on {out_date} one way {cabin} class"
     else:
         q = f"Flights from {origin} to {dest} on {out_date} returning {ret_date} {cabin} class"
-    url = f"https://www.google.com/travel/flights?q={q.replace(' ', '+')}"
+    # Always use google.com with hl=en — localized domains don't parse English queries
+    # The currency param + browser locale/geo are what affect pricing
+    url = f"https://www.google.com/travel/flights?q={q.replace(' ', '+')}&curr={currency}&hl=en"
     page.goto(url, timeout=30000)
     human_delay(5, 9)
 
@@ -109,7 +139,9 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
     items = page.locator("li").all()
     for item in items:
         text = item.inner_text().strip()
-        if not re.search(r"\$[\d,]+", text):
+        # Match prices in any currency: $1,234 or 1.234 € or £1,234 or 1 234 €
+        # \xa0 is non-breaking space used in European formatting
+        if not re.search(r"[$€£]\s*[\d.,\xa0]+|[\d.,\xa0]+\s*[$€£]|[\d.,]+\s*(?:USD|EUR|GBP)", text):
             continue
         if len(text) < 30 or len(text) > 800:
             continue
@@ -118,9 +150,35 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
         if not airlines:
             continue
 
-        price_m = re.search(r"\$([\d,]+)", text)
-        price = int(price_m.group(1).replace(",", "")) if price_m else 0
-        if price < 100 or price > 50000:
+        # Extract price — handle multiple formats:
+        # US: $5,274  |  EUR: €4.831 or 4.831 € or 4 831 €  |  UK: £3,200
+        price_m = (
+            re.search(r"[$€£]\s*([\d.,\xa0]+)", text)
+            or re.search(r"([\d.,\xa0]+)\s*[$€£]", text)
+            or re.search(r"([\d.,]+)\s*(?:USD|EUR|GBP)", text)
+        )
+        if not price_m:
+            continue
+        price_str = price_m.group(1).replace("\xa0", "").strip()
+        # Handle European number format (1.234,56 → 1234.56) vs US (1,234.56)
+        if "." in price_str and "," in price_str:
+            if price_str.rindex(",") > price_str.rindex("."):
+                price_str = price_str.replace(".", "").replace(",", ".")
+            else:
+                price_str = price_str.replace(",", "")
+        elif "." in price_str and price_str.count(".") > 1:
+            # Multiple dots: 1.234.567 → European thousands separator
+            price_str = price_str.replace(".", "")
+        elif "." in price_str and len(price_str.split(".")[-1]) == 3:
+            # Single dot as thousands: 5.274 → 5274
+            price_str = price_str.replace(".", "")
+        else:
+            price_str = price_str.replace(",", "")
+        try:
+            price = int(float(price_str))
+        except ValueError:
+            continue
+        if price < 30 or price > 100000:
             continue
 
         # Extract times (there will be 4 for round-trip: dep1, arr1, dep2, arr2)
@@ -197,11 +255,12 @@ def main():
     VAULT_FLIGHTS.mkdir(parents=True, exist_ok=True)
 
     slug = f"{args.origin.lower()}-{args.dest.lower()}"
+    country_suffix = f"-{args.country.lower()}" if args.country != "US" else ""
 
-    # Resolve output paths
-    csv_path = args.csv or str(VAULT_FLIGHTS / f"{slug}-roundtrip.csv")
-    html_path = args.html or str(VAULT_FLIGHTS / f"{slug}-report.html")
-    json_path = args.json_out or str(DATA_DIR / f"{slug}_results.json")
+    # Resolve output paths — append country code for non-US searches
+    csv_path = args.csv or str(VAULT_FLIGHTS / f"{slug}{country_suffix}-roundtrip.csv")
+    html_path = args.html or str(VAULT_FLIGHTS / f"{slug}{country_suffix}-report.html")
+    json_path = args.json_out or str(DATA_DIR / f"{slug}{country_suffix}_results.json")
 
     # Build date lists
     if args.out_dates:
@@ -248,15 +307,27 @@ def main():
     all_results = []
     airlines_filter = set(a.strip() for a in args.airlines.split(",")) if args.airlines else None
 
+    # Country settings
+    country = COUNTRY_PRESETS[args.country]
+    currency = args.currency or country["currency"]
+    domain = country["domain"]
+    currency_symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=not args.headed,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+        launch_opts = {
+            "headless": not args.headed,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
+        if args.proxy:
+            launch_opts["proxy"] = {"server": args.proxy}
+
+        browser = pw.chromium.launch(**launch_opts)
         ctx = browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
+            locale=country["locale"],
+            timezone_id=country["tz"],
+            geolocation=country["geo"],
+            permissions=["geolocation"],
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
         ctx.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined})')
@@ -265,6 +336,9 @@ def main():
         print(f"\n{'='*60}")
         print(f"  {trip_type}: {args.origin} {'→' if args.one_way else '↔'} {args.dest} | {args.cabin}")
         print(f"  {len(pairs)} searches | airlines: {airlines_filter or 'all'}")
+        print(f"  Country: {args.country} | Currency: {currency} | Domain: {domain}")
+        if args.proxy:
+            print(f"  Proxy: {args.proxy}")
         print(f"{'='*60}\n")
 
         for i, (out_date, ret_date, stay) in enumerate(pairs):
@@ -273,7 +347,7 @@ def main():
             else:
                 print(f"[{i+1}/{len(pairs)}] {out_date} → {ret_date} ({stay}d)...", end=" ", flush=True)
 
-            flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, args.debug)
+            flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, domain, currency, args.debug)
 
             # Filter to airlines of interest
             if airlines_filter:
@@ -287,7 +361,7 @@ def main():
 
             if interesting:
                 best = min(interesting, key=lambda x: x["total_price"])
-                print(f"{len(interesting)} matches, best: {best['airline']} ${best['total_price']:,}")
+                print(f"{len(interesting)} matches, best: {best['airline']} {currency_symbol}{best['total_price']:,}")
             else:
                 print(f"{len(flights)} flights, 0 matches")
 
@@ -306,8 +380,10 @@ def main():
                     "ret_arrival": f["ret_arrival"],
                     "ret_duration": f["ret_duration"],
                     "ret_stops": f["ret_stops"],
-                    "total_price": f"${f['total_price']:,}",
+                    "total_price": f"{currency_symbol}{f['total_price']:,}",
                     "total_price_num": f["total_price"],
+                    "currency": currency,
+                    "country": args.country,
                     "search_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 })
 

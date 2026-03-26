@@ -197,11 +197,17 @@ def main():
     VAULT_FLIGHTS.mkdir(parents=True, exist_ok=True)
 
     slug = f"{args.origin.lower()}-{args.dest.lower()}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # Resolve output paths
+    # Resolve output paths — timestamped for history, plus a "latest" copy
+    history_dir = VAULT_FLIGHTS / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
     csv_path = args.csv or str(VAULT_FLIGHTS / f"{slug}-roundtrip.csv")
     html_path = args.html or str(VAULT_FLIGHTS / f"{slug}-report.html")
     json_path = args.json_out or str(DATA_DIR / f"{slug}_results.json")
+    csv_history = str(history_dir / f"{slug}-{timestamp}.csv")
+    html_history = str(history_dir / f"{slug}-{timestamp}.html")
 
     # Build date lists
     if args.out_dates:
@@ -363,6 +369,12 @@ def main():
         generate_report(csv_path, html_path)
     except Exception as e:
         print(f"Report generation: {e}")
+
+    # Save timestamped copies for history
+    import shutil
+    shutil.copy2(csv_path, csv_history)
+    shutil.copy2(html_path, html_history)
+    print(f"History: {csv_history}")
 
     # Summary
     print(f"\n{'='*60}")

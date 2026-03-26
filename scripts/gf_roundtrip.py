@@ -589,8 +589,74 @@ def main():
     # Sort by price
     all_results.sort(key=lambda x: x["total_price_num"])
 
-    # Save raw JSON
-    Path(json_path).write_text(json.dumps(all_results, indent=2, default=str))
+    # === Auto Spain price comparison (for US searches) ===
+    spain_data = None
+    if args.country == "US" and not args.one_way and all_results:
+        try:
+            from brightdata import search_from_country as bd_search, get_api_key as bd_get_key
+            bd_key = bd_get_key()
+            if bd_key:
+                seen_pairs = set()
+                top_for_spain = []
+                for r in all_results:
+                    pk = (r.get("outbound_date"), r.get("return_date"))
+                    if pk in seen_pairs or not pk[0] or not pk[1]:
+                        continue
+                    seen_pairs.add(pk)
+                    top_for_spain.append(r)
+                    if len(top_for_spain) >= 10:
+                        break
+
+                print(f"\n{'='*70}")
+                print(f"  SPAIN PRICE COMPARISON (top {len(top_for_spain)} US results)")
+                print(f"  Via Bright Data Web Unlocker (~$0.003/request)")
+                print(f"{'='*70}\n")
+
+                eur_usd = 1.08
+                comps = []
+                bd_reqs = 0
+                for idx, us_r in enumerate(top_for_spain):
+                    od, rd = us_r["outbound_date"], us_r["return_date"]
+                    print(f"  [{idx+1}/{len(top_for_spain)}] {od} -> {rd}...", end=" ", flush=True)
+                    try:
+                        es_fl = bd_search(args.origin, args.dest, od, rd, args.cabin, "es", False, bd_key)
+                        bd_reqs += 1
+                    except Exception as exc:
+                        print(f"ERROR: {str(exc)[:40]}")
+                        continue
+                    es_best = min(es_fl, key=lambda x: x["total_price"]) if es_fl else None
+                    us_p = us_r.get("total_price_num", 0)
+                    if es_best:
+                        es_eur = es_best["total_price"]
+                        es_usd = es_eur * eur_usd
+                        sav = us_p - es_usd
+                        pct = (sav / us_p * 100) if us_p else 0
+                        print(f"EUR {es_eur:,} (~${es_usd:,.0f}) savings: ${sav:+,.0f} ({pct:+.0f}%)")
+                        comps.append({
+                            "outbound_date": od, "return_date": rd,
+                            "us_airline": us_r.get("airline", ""), "us_price_usd": us_p,
+                            "es_airline": es_best.get("airline", ""), "es_price_eur": es_eur,
+                            "es_price_usd": round(es_usd), "savings_usd": round(sav), "savings_pct": round(pct, 1),
+                        })
+                    else:
+                        print("no results")
+                    time.sleep(2)
+
+                bd_cost = bd_reqs * 0.003
+                spain_data = {"comparisons": comps, "bd_requests": bd_reqs, "bd_cost": bd_cost}
+                if comps:
+                    avg_s = sum(c["savings_usd"] for c in comps) / len(comps)
+                    best_s = max(comps, key=lambda c: c["savings_usd"])
+                    print(f"\n  Avg savings from Spain: ${avg_s:+,.0f} | Best: ${best_s['savings_usd']:+,}")
+                    print(f"  Bright Data cost: ${bd_cost:.3f} ({bd_reqs} requests)")
+        except ImportError:
+            pass
+
+    # Save raw JSON (include Spain comparison)
+    save_payload = all_results
+    if spain_data:
+        save_payload = {"results": all_results, "spain_comparison": spain_data}
+    Path(json_path).write_text(json.dumps(save_payload, indent=2, default=str))
     print(f"\nJSON: {json_path}")
 
     # Write CSV
@@ -651,6 +717,21 @@ def main():
             print(f"  {rank:2d}. {r['airline']:<25s} {r['total_price']:>8s}  "
                   f"{r['outbound_date']}→{r['return_date']} ({r['stay_days']}d)  "
                   f"{r['out_stops']} / {r['ret_stops']}")
+
+
+    # Spain comparison table in summary
+    if spain_data and spain_data.get("comparisons"):
+        comps = spain_data["comparisons"]
+        print(f"\n{'='*70}")
+        print(f"  US vs SPAIN PRICE COMPARISON")
+        print(f"{'='*70}")
+        print(f"  {'Dates':<26s} {'US (USD)':>9s} {'ES (EUR)':>9s} {'ES ~USD':>9s} {'Savings':>12s}")
+        print(f"  {'-'*66}")
+        for c in comps:
+            d = f"{c['outbound_date']} -> {c['return_date']}"
+            print(f"  {d:<26s} ${c['us_price_usd']:>7,}  EUR{c['es_price_eur']:>6,}  ${c['es_price_usd']:>7,}  ${c['savings_usd']:>+7,} ({c['savings_pct']:+.0f}%)")
+        avg = sum(c["savings_usd"] for c in comps) / len(comps)
+        print(f"\n  Avg savings: ${avg:+,.0f} | BD cost: ${spain_data['bd_cost']:.3f}")
 
 
 if __name__ == "__main__":

@@ -361,6 +361,8 @@ def main():
 
     all_results = []
     airlines_filter = set(a.strip() for a in args.airlines.split(",")) if args.airlines else None
+    bd_request_count = 0
+    bd_cost_per_request = 0.003  # ~$0.003 per Web Unlocker request
 
     # Country settings
     country = COUNTRY_PRESETS[args.country]
@@ -368,20 +370,139 @@ def main():
     domain = country["domain"]
     currency_symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
 
-    # Auto-find proxy for non-US countries if none provided
+    # For non-US countries, try Bright Data Web Unlocker instead of proxy
+    use_brightdata = False
+    bd_api_key = None
     if args.country != "US" and not args.proxy:
         try:
-            from find_proxy import get_proxy
-            print(f"Finding a {args.country} proxy...")
-            proxy = get_proxy((args.country,) + ("PT", "FR", "DE"))
-            if proxy:
-                args.proxy = proxy
-                print(f"Using proxy: {proxy}")
+            from brightdata import get_api_key, search_from_country, CURRENCY_MAP
+            bd_api_key = get_api_key()
+            if bd_api_key:
+                use_brightdata = True
+                print(f"Using Bright Data Web Unlocker for {args.country.upper()} pricing (~$0.003/request)")
             else:
-                print("No working proxy found — searching with US IP but EU locale/currency")
+                print("No Bright Data API key — run: python brightdata.py --setup YOUR_KEY")
+                print("Searching with US IP but EU locale/currency")
         except ImportError:
-            print("find_proxy.py not available — searching without proxy")
+            print("brightdata.py not available — searching without geo-pricing")
 
+    # === Bright Data path (non-US countries) ===
+    if use_brightdata:
+        from brightdata import search_from_country, CURRENCY_MAP
+        bd_currency = CURRENCY_MAP.get(args.country.lower(), "USD")
+
+        for i, (out_date, ret_date, stay) in enumerate(pairs):
+            if args.one_way:
+                print(f"[{i+1}/{len(pairs)}] {out_date}...", end=" ", flush=True)
+            else:
+                print(f"[{i+1}/{len(pairs)}] {out_date} → {ret_date} ({stay}d)...", end=" ", flush=True)
+
+            try:
+                flights = search_from_country(
+                    args.origin, args.dest, out_date, ret_date,
+                    args.cabin, args.country, args.one_way, bd_api_key
+                )
+                bd_request_count += 1
+            except Exception as e:
+                print(f"ERROR: {str(e)[:60]}")
+                continue
+
+            if airlines_filter:
+                interesting = [f for f in flights
+                               if any(a.lower() in f["airline"].lower() for a in airlines_filter)]
+            else:
+                interesting = flights
+
+            if interesting:
+                best = min(interesting, key=lambda x: x["total_price"])
+                print(f"{len(interesting)} matches, best: {best['airline']} {currency_symbol}{best['total_price']:,}")
+            else:
+                print(f"{len(flights)} flights, 0 matches")
+
+            for f in interesting:
+                all_results.append({
+                    "airline": f["airline"],
+                    "class": args.cabin,
+                    "outbound_date": out_date,
+                    "return_date": ret_date or "",
+                    "stay_days": stay,
+                    "out_departure": f.get("out_departure", ""),
+                    "out_arrival": f.get("out_arrival", ""),
+                    "out_duration": f.get("out_duration", ""),
+                    "out_stops": f.get("out_stops", ""),
+                    "ret_departure": f.get("ret_departure", ""),
+                    "ret_arrival": f.get("ret_arrival", ""),
+                    "ret_duration": f.get("ret_duration", ""),
+                    "ret_stops": f.get("ret_stops", ""),
+                    "total_price": f"{currency_symbol}{f['total_price']:,}",
+                    "total_price_num": f["total_price"],
+                    "currency": currency,
+                    "country": args.country,
+                    "search_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                })
+
+            human_delay(2, 5)  # Lighter delays for API calls
+
+        # Skip Playwright section
+        all_results.sort(key=lambda x: x["total_price_num"])
+        bd_total_cost = bd_request_count * bd_cost_per_request
+        print(f"\nBright Data: {bd_request_count} requests, estimated cost: ${bd_total_cost:.3f}")
+
+        # Jump to output
+        Path(json_path).write_text(json.dumps(all_results, indent=2, default=str))
+        print(f"JSON: {json_path}")
+
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        for r in all_results:
+            r["out_flight"] = r["airline"]
+            r["ret_flight"] = r["airline"]
+            r["out_price"] = "RT"
+            r["ret_price"] = "RT"
+            r["out_price_num"] = r["total_price_num"] if args.one_way else r["total_price_num"] / 2
+            r["ret_price_num"] = 0 if args.one_way else r["total_price_num"] / 2
+            r["bd_cost"] = f"${bd_total_cost:.3f}"
+
+        fields_full = [
+            "airline", "class", "outbound_date", "return_date", "stay_days",
+            "out_flight", "out_departure", "out_arrival", "out_duration", "out_stops", "out_price",
+            "ret_flight", "ret_departure", "ret_arrival", "ret_duration", "ret_stops", "ret_price",
+            "total_price", "search_date",
+        ]
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            import csv as csv_mod
+            writer = csv_mod.DictWriter(f, fieldnames=fields_full, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"CSV: {csv_path} ({len(all_results)} rows)")
+
+        try:
+            sys.path.insert(0, str(SCRIPTS_DIR))
+            from generate_report import generate_report
+            generate_report(csv_path, html_path)
+        except Exception as e:
+            print(f"Report: {e}")
+
+        # Summary
+        print(f"\n{'='*60}")
+        print(f"TOP 20 CHEAPEST (from {args.country.upper()}, {currency})")
+        print(f"{'='*60}")
+        seen = set()
+        rank = 0
+        for r in all_results:
+            key = (r["airline"], r["total_price_num"], r["outbound_date"], r.get("return_date", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            rank += 1
+            if rank > 20:
+                break
+            print(f"  {rank:2d}. {r['airline']:<30s} {r['total_price']:>10s}  "
+                  f"{r['outbound_date']}→{r.get('return_date','')} ({r['stay_days']}d)")
+
+        print(f"\nBright Data cost: ${bd_total_cost:.3f} ({bd_request_count} requests)")
+        return
+
+    # === Playwright path (US or with proxy) ===
     with sync_playwright() as pw:
         launch_opts = {
             "headless": not args.headed,

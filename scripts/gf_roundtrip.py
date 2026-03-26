@@ -146,9 +146,15 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
         if len(text) < 30 or len(text) > 800:
             continue
 
-        airlines = AIRLINE_PATTERN.findall(text)
-        if not airlines:
+        # Extract the PRIMARY airline — the first one mentioned is the operating carrier.
+        # Google Flights lists the operating airline first, then codeshare partners.
+        # We only take the first 1-2 airlines (operating + maybe codeshare operator).
+        all_airlines = AIRLINE_PATTERN.findall(text)
+        if not all_airlines:
             continue
+        # Use only the first airline (operating carrier), or first two if it's a codeshare
+        # like "United, Lufthansa" (one operates outbound, other returns)
+        airlines = all_airlines[:2]
 
         # Extract price — handle multiple formats:
         # US: $5,274  |  EUR: €4.831 or 4.831 € or 4 831 €  |  UK: £3,200
@@ -408,8 +414,11 @@ def main():
                 continue
 
             if airlines_filter:
-                interesting = [f for f in flights
-                               if any(a.lower() in f["airline"].lower() for a in airlines_filter)]
+                interesting = []
+                for f in flights:
+                    primary = f["airline"].split(",")[0].strip().lower()
+                    if any(a.lower() == primary or a.lower() in primary for a in airlines_filter):
+                        interesting.append(f)
             else:
                 interesting = flights
 
@@ -539,12 +548,13 @@ def main():
 
             flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, domain, currency, args.debug)
 
-            # Filter to airlines of interest
+            # Filter to airlines of interest — match the PRIMARY airline (first in the list)
             if airlines_filter:
                 interesting = []
                 for f in flights:
-                    airline_lower = f["airline"].lower()
-                    if any(a.lower() in airline_lower for a in airlines_filter):
+                    # The airline field is "Primary, Secondary" — check the FIRST one
+                    primary = f["airline"].split(",")[0].strip().lower()
+                    if any(a.lower() == primary or a.lower() in primary for a in airlines_filter):
                         interesting.append(f)
             else:
                 interesting = flights

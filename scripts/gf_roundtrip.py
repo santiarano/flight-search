@@ -281,12 +281,12 @@ def main():
 
             flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, args.debug)
 
-            # Filter to airlines of interest
+            # Filter to airlines of interest — check PRIMARY airline (first one listed)
             if airlines_filter:
                 interesting = []
                 for f in flights:
-                    airline_lower = f["airline"].lower()
-                    if any(a.lower() in airline_lower for a in airlines_filter):
+                    primary = f["airline"].split(",")[0].strip().lower()
+                    if any(a.lower() in primary for a in airlines_filter):
                         interesting.append(f)
             else:
                 interesting = flights

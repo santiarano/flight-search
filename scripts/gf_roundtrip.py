@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Google Flights scraper — general purpose, any route/dates/class/airline.
-Searches actual round-trip or one-way fares via Playwright.
+Google Flights scraper — THE CORRECT PROCESS (CLAUDE.md steps 1-27).
+
+1-4: Load route + cabin
+5-9: Departure calendar → find cheapest outbound → click it
+10-16: Return calendar → find cheapest return in stay range → click it
+17: Search
+18-22: Airline filter (deselect all, select targets) + stops filter + extract
+23-24: Date arrow shifts for more combinations
+25-27: CSV + HTML report
 
 Usage:
-    python gf_roundtrip.py --origin SFO --dest BCN --out-start 2026-04-20 --out-end 2026-05-16 \
-        --ret-start 2026-06-28 --ret-end 2026-07-22 --cabin business --airlines "United,TAP"
-    python gf_roundtrip.py --origin SFO --dest BCN --out-dates 2026-05-12 --ret-dates 2026-07-08
-    python gf_roundtrip.py --origin SFO --dest BCN --out-dates 2026-05-12 --one-way --cabin business
+    python gf_roundtrip.py --origin SFO --dest BCN --cabin business \\
+      --airlines "United,Tap Air Portugal,LEVEL" \\
+      --out-target 2026-05-01 --ret-target 2026-07-08 \\
+      --min-stay 60 --max-stay 80 --headed
 """
-import sys, os, time, re, json, csv, random, argparse
+import sys, os, time, re, json, csv, argparse, shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from playwright.sync_api import sync_playwright
 
@@ -23,275 +31,165 @@ SCRIPTS_DIR = Path(__file__).parent
 DATA_DIR = SCRIPTS_DIR / "gf_data"
 VAULT_FLIGHTS = Path(os.path.expanduser("~/clawd/obsidian-vault/flights"))
 
-AIRLINE_PATTERN = re.compile(
-    r"(United(?:Lufthansa)?|United|TAP|Tap Air Portugal|LEVEL|Iberia|American|Delta|"
-    r"SWISS|British Airways|Air France|KLM|Lufthansa|LOT|Aer Lingus|Finnair|Turkish|Norse|"
-    r"Emirates|Qatar|Etihad|Singapore|Cathay|ANA|JAL|Korean Air|Avianca|LATAM|"
-    r"Vueling|Ryanair|easyJet|Norwegian|JetBlue|Southwest|Alaska|Spirit|Frontier|"
-    r"Air Canada|WestJet|Condor|Icelandair|SAS|Wizz Air|Volaris|Copa|Aeromexico)"
-)
+MONTH_MAP = {"January":1,"February":2,"March":3,"April":4,"May":5,"June":6,
+             "July":7,"August":8,"September":9,"October":10,"November":11,"December":12}
+MONTH_NAMES = {v: k for k, v in MONTH_MAP.items()}
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Google Flights scraper — any route/dates/class")
-    # Route
-    p.add_argument("--origin", required=True, help="Origin airport code (e.g. SFO)")
-    p.add_argument("--dest", required=True, help="Destination airport code (e.g. BCN)")
-    # Dates
-    p.add_argument("--out-dates", default=None, help="Comma-separated outbound dates")
-    p.add_argument("--ret-dates", default=None, help="Comma-separated return dates")
-    p.add_argument("--out-start", default=None, help="Outbound range start (YYYY-MM-DD)")
-    p.add_argument("--out-end", default=None, help="Outbound range end")
-    p.add_argument("--ret-start", default=None, help="Return range start")
-    p.add_argument("--ret-end", default=None, help="Return range end")
-    p.add_argument("--date-step", type=int, default=2, help="Days between sampled dates (default: 2)")
-    p.add_argument("--one-way", action="store_true", help="One-way search")
-    # Filters
-    p.add_argument("--cabin", default="economy", choices=["economy", "premium economy", "business", "first"])
-    p.add_argument("--airlines", default=None, help="Comma-separated airline filter (default: all)")
-    p.add_argument("--min-stay", type=int, default=0)
-    p.add_argument("--max-stay", type=int, default=999)
-    # Output
+    p = argparse.ArgumentParser(description="Google Flights scraper — correct process")
+    p.add_argument("--origin", required=True)
+    p.add_argument("--dest", required=True)
+    p.add_argument("--cabin", default="business", choices=["economy","premium economy","business","first"])
+    p.add_argument("--airlines", required=True, help="Comma-separated: United,Tap Air Portugal,LEVEL")
+    p.add_argument("--out-target", required=True, help="Ideal outbound date YYYY-MM-DD")
+    p.add_argument("--ret-target", required=True, help="Ideal return date YYYY-MM-DD")
+    p.add_argument("--min-stay", type=int, default=60)
+    p.add_argument("--max-stay", type=int, default=80)
+    p.add_argument("--max-stops", default="1 stop or fewer")
+    p.add_argument("--top-outbound", type=int, default=3, help="Top N outbound dates to explore")
+    p.add_argument("--date-shifts", type=int, default=4, help="Date arrow shifts per combo")
+    p.add_argument("--headed", action="store_true")
     p.add_argument("--csv", default=None)
     p.add_argument("--html", default=None)
-    p.add_argument("--json-out", default=None)
-    # Browser
-    p.add_argument("--headed", action="store_true")
-    p.add_argument("--delay-min", type=float, default=5)
-    p.add_argument("--delay-max", type=float, default=10)
-    p.add_argument("--debug", action="store_true")
     return p.parse_args()
-
-
-def human_delay(lo=3, hi=7):
-    time.sleep(random.uniform(lo, hi))
 
 
 def click_el(page, locator):
     el = locator.first
     box = el.bounding_box()
     if box and box["width"] > 0:
-        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
         return True
     return False
 
 
-def apply_airline_filter(page, airline_names):
-    """Click Airlines filter on Google Flights, select ONLY the specified airlines."""
+def extract_calendar_prices(page, target_months=None):
+    prices = {}
     try:
-        btn = page.locator('button:has-text("Airlines"), button:has-text("All airlines")')
-        if btn.count() == 0:
-            return False
-        click_el(page, btn)
-        human_delay(1, 2)
-
-        # Clear all selections first
-        for txt in ["Clear airline selections", "Reset"]:
+        labeled = page.locator('[role="gridcell"] [aria-label]').all()
+        for el in labeled:
             try:
-                el = page.locator(f'a:has-text("{txt}"), button:has-text("{txt}"), span:has-text("{txt}")')
-                if el.count() > 0:
-                    click_el(page, el)
-                    human_delay(0.5, 1)
-                    break
-            except:
-                pass
-
-        # Select each target airline
-        for name in airline_names:
-            for sel in [f'label:has-text("{name}")', f'div[role="checkbox"]:has-text("{name}")', f'li:has-text("{name}")']:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        click_el(page, el)
-                        human_delay(0.3, 0.6)
-                        break
-                except:
+                label = el.get_attribute("aria-label") or ""
+                dm = re.search(r"(\w+)\s+(\d{1,2}),\s+(\d{4})", label)
+                if not dm:
                     continue
-
-        # Close filter
-        human_delay(0.5, 1)
-        try:
-            close = page.locator('button:has-text("Close"), button[aria-label="Close"]')
-            if close.count() > 0:
-                click_el(page, close)
-            else:
-                page.keyboard.press("Escape")
-        except:
-            page.keyboard.press("Escape")
-        human_delay(2, 4)
-        return True
-    except:
-        try:
-            page.keyboard.press("Escape")
-        except:
-            pass
-        return False
-
-
-def apply_stops_filter(page, max_stops=1):
-    """Click Stops filter, select 1 stop or fewer."""
-    try:
-        btn = page.locator('button:has-text("Stops"), button:has-text("stops")')
-        if btn.count() == 0:
-            return
-        click_el(page, btn)
-        human_delay(0.5, 1)
-
-        if max_stops == 0:
-            target = page.locator('label:has-text("Nonstop only"), li:has-text("Nonstop only")')
-        else:
-            target = page.locator('label:has-text("1 stop or fewer"), li:has-text("1 stop or fewer")')
-        if target.count() > 0:
-            click_el(page, target)
-            human_delay(0.5, 1)
-
-        try:
-            close = page.locator('button:has-text("Close"), button[aria-label="Close"]')
-            if close.count() > 0:
-                click_el(page, close)
-            else:
-                page.keyboard.press("Escape")
-        except:
-            page.keyboard.press("Escape")
-        human_delay(1, 2)
-    except:
-        try:
-            page.keyboard.press("Escape")
-        except:
-            pass
-
-
-def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=False, debug=False,
-                     filter_airlines=None, max_stops=1):
-    """
-    Search flights on Google Flights:
-    1. Load URL with route + dates + class
-    2. Apply airline filter (ONLY show target airlines)
-    3. Apply stops filter (direct or 1 stop)
-    4. Extract filtered results
-    """
-    if one_way or not ret_date:
-        q = f"Flights from {origin} to {dest} on {out_date} one way {cabin} class"
-    else:
-        q = f"Flights from {origin} to {dest} on {out_date} returning {ret_date} {cabin} class"
-    url = f"https://www.google.com/travel/flights?q={q.replace(' ', '+')}"
-    page.goto(url, timeout=30000)
-    human_delay(5, 9)
-
-    # STEP 1: Apply airline filter — forces Google to show only our airlines
-    if filter_airlines:
-        apply_airline_filter(page, filter_airlines)
-
-    # STEP 2: Apply stops filter
-    apply_stops_filter(page, max_stops)
-
-    # STEP 3: Scroll and expand to see all filtered results
-    page.mouse.wheel(0, 500)
-    human_delay(1, 2)
-
-    try:
-        for txt in ["more flights", "View more", "Other flights", "Show more"]:
-            more = page.locator(f'button:has-text("{txt}")')
-            if more.count() > 0:
-                click_el(page, more)
-                human_delay(2, 3)
-                break
+                month_name, day, year = dm.group(1), int(dm.group(2)), int(dm.group(3))
+                month_num = MONTH_MAP.get(month_name)
+                if not month_num:
+                    continue
+                if target_months and month_num not in target_months:
+                    continue
+                date_str = f"{year}-{month_num:02d}-{day:02d}"
+                parent = el.locator("..").first
+                text = parent.inner_text(timeout=1000).strip()
+                pm = re.search(r"\$([\d,]+)", text)
+                if pm:
+                    prices[date_str] = int(pm.group(1).replace(",", ""))
+            except:
+                continue
     except:
         pass
+    return prices
 
-    page.mouse.wheel(0, 500)
-    human_delay(1, 2)
 
-    results = []
+def navigate_back(page, target_months):
+    """Click LEFT arrow until target months have prices."""
+    for _ in range(20):
+        prices = extract_calendar_prices(page, target_months)
+        if prices:
+            return prices
+        prev = page.locator('button[aria-label="Previous"]')
+        if prev.count() > 0:
+            click_el(page, prev)
+            time.sleep(1.5)
+    return {}
 
-    # Google Flights round-trip results show the total price
-    # Each result is a li with airline, times, duration, stops, and TOTAL price
-    items = page.locator("li").all()
-    for item in items:
-        try:
-            text = item.inner_text(timeout=3000).strip()
-        except:
-            continue
-        if not re.search(r"\$[\d,]+", text):
-            continue
-        if len(text) < 30 or len(text) > 800:
-            continue
 
-        airlines = AIRLINE_PATTERN.findall(text)
-        if not airlines:
-            continue
+def navigate_forward(page, target_months):
+    """Click RIGHT arrow until target months have prices."""
+    for _ in range(15):
+        prices = extract_calendar_prices(page, target_months)
+        if prices:
+            return prices
+        nxt = page.locator('button[aria-label="Next"]')
+        if nxt.count() > 0:
+            click_el(page, nxt)
+            time.sleep(1.5)
+    return {}
 
-        price_m = re.search(r"\$([\d,]+)", text)
-        price = int(price_m.group(1).replace(",", "")) if price_m else 0
-        if price < 100 or price > 50000:
-            continue
 
-        # Extract times (there will be 4 for round-trip: dep1, arr1, dep2, arr2)
-        times = re.findall(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text)
+def click_date(page, date_str):
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    label = f"{dt.strftime('%A')}, {dt.strftime('%B')} {dt.day}, {dt.year}"
+    el = page.locator(f'[aria-label="{label}"]')
+    if el.count() > 0:
+        click_el(page, el)
+        return True
+    el = page.locator(f'[aria-label*="{dt.strftime("%B")} {dt.day}, {dt.year}"]')
+    if el.count() > 0:
+        click_el(page, el)
+        return True
+    return False
 
-        # Extract durations (2 for round-trip)
-        durations = re.findall(r"\d+\s*hr\s*(?:\d+\s*min)?", text)
 
-        # Stops
-        stop_texts = re.findall(r"Nonstop|\d+\s*stop", text, re.I)
-
-        # Airline - for codeshares like "UnitedLufthansa" in the raw text
-        airline_str = ", ".join(dict.fromkeys(airlines))  # dedupe preserving order
-
-        # Check for "UnitedLufthansa" pattern (Google merges them)
-        if "UnitedLufthansa" in text:
-            airline_str = "United, Lufthansa"
-        elif "Tap Air Portugal" in text:
-            airline_str = "TAP Portugal"
-
-        results.append({
-            "airline": airline_str,
-            "total_price": price,
-            "out_departure": times[0] if len(times) >= 1 else "",
-            "out_arrival": times[1] if len(times) >= 2 else "",
-            "ret_departure": times[2] if len(times) >= 3 else "",
-            "ret_arrival": times[3] if len(times) >= 4 else "",
-            "out_duration": durations[0] if len(durations) >= 1 else "",
-            "ret_duration": durations[1] if len(durations) >= 2 else "",
-            "out_stops": stop_texts[0] if len(stop_texts) >= 1 else "",
-            "ret_stops": stop_texts[1] if len(stop_texts) >= 2 else "",
-            "raw_text": text[:300],
-        })
-
-    # Deduplicate
+def extract_results(page):
+    flights = []
+    try:
+        items = page.locator("li").all()
+        for item in items:
+            try:
+                text = item.inner_text(timeout=2000).strip()
+            except:
+                continue
+            if len(text) < 30 or len(text) > 800:
+                continue
+            price_m = re.search(r"\$([\d,]+)", text)
+            if not price_m:
+                continue
+            price = int(price_m.group(1).replace(",", ""))
+            if price < 500 or price > 50000:
+                continue
+            airlines = re.findall(
+                r"(United|Tap Air Portugal|LEVEL|Iberia|Lufthansa|SWISS|American|Delta|"
+                r"Alaska|Condor|KLM|Air France|British Airways)", text)[:2]
+            if not airlines:
+                continue
+            stops = re.findall(r"Nonstop|\d+\s*stop", text, re.I)
+            durs = re.findall(r"\d+\s*hr\s*(?:\d+\s*min)?", text)
+            times_found = re.findall(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text)
+            flights.append({
+                "airline": ", ".join(dict.fromkeys(airlines)),
+                "price": price,
+                "stops": stops[0] if stops else "?",
+                "duration": durs[0] if durs else "?",
+                "dep": times_found[0] if times_found else "",
+                "arr": times_found[1] if len(times_found) > 1 else "",
+            })
+    except:
+        pass
     seen = set()
     unique = []
-    for r in results:
-        key = (r["airline"], r["total_price"], r["out_departure"])
+    for f in flights:
+        key = (f["airline"][:20], f["price"])
         if key not in seen:
             seen.add(key)
-            unique.append(r)
-
-    return unique
-
-
-def generate_date_pairs(out_dates, ret_dates, min_stay, max_stay):
-    """Generate valid (out, ret) pairs within stay constraints."""
-    pairs = []
-    for od in out_dates:
-        odt = datetime.strptime(od, "%Y-%m-%d")
-        for rd in ret_dates:
-            rdt = datetime.strptime(rd, "%Y-%m-%d")
-            stay = (rdt - odt).days
-            if min_stay <= stay <= max_stay:
-                pairs.append((od, rd, stay))
-    return pairs
+            unique.append(f)
+    return sorted(unique, key=lambda x: x["price"])
 
 
-def generate_dates(start_str, end_str, step=2):
-    """Generate date list from start to end with given step."""
-    dates = []
-    current = datetime.strptime(start_str, "%Y-%m-%d")
-    end = datetime.strptime(end_str, "%Y-%m-%d")
-    while current <= end:
-        dates.append(current.strftime("%Y-%m-%d"))
-        current += timedelta(days=step)
-    return dates
+def make_result_row(f, cabin, out_date, ret_date, stay):
+    return {
+        "airline": f["airline"], "class": cabin,
+        "outbound_date": out_date, "return_date": ret_date, "stay_days": stay,
+        "out_flight": f["airline"], "out_departure": f.get("dep",""),
+        "out_arrival": f.get("arr",""), "out_duration": f["duration"],
+        "out_stops": f["stops"], "out_price": "RT",
+        "ret_flight": f["airline"], "ret_departure": "", "ret_arrival": "",
+        "ret_duration": "", "ret_stops": "", "ret_price": "RT",
+        "total_price": f"${f['price']:,}", "total_price_num": f["price"],
+        "search_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
 
 
 def main():
@@ -300,207 +198,256 @@ def main():
     VAULT_FLIGHTS.mkdir(parents=True, exist_ok=True)
 
     slug = f"{args.origin.lower()}-{args.dest.lower()}"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-
-    # Resolve output paths — timestamped for history, plus a "latest" copy
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
     history_dir = VAULT_FLIGHTS / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
-
     csv_path = args.csv or str(VAULT_FLIGHTS / f"{slug}-roundtrip.csv")
     html_path = args.html or str(VAULT_FLIGHTS / f"{slug}-report.html")
-    json_path = args.json_out or str(DATA_DIR / f"{slug}_results.json")
-    csv_history = str(history_dir / f"{slug}-{timestamp}.csv")
-    html_history = str(history_dir / f"{slug}-{timestamp}.html")
 
-    # Build date lists
-    if args.out_dates:
-        out_dates = [d.strip() for d in args.out_dates.split(",")]
-    elif args.out_start and args.out_end:
-        out_dates = generate_dates(args.out_start, args.out_end, args.date_step)
-    else:
-        print("ERROR: Provide --out-dates or --out-start/--out-end", file=sys.stderr)
-        sys.exit(1)
-
-    if args.one_way:
-        ret_dates = [None]
-    elif args.ret_dates:
-        ret_dates = [d.strip() for d in args.ret_dates.split(",")]
-    elif args.ret_start and args.ret_end:
-        ret_dates = generate_dates(args.ret_start, args.ret_end, args.date_step)
-    else:
-        print("ERROR: Provide --ret-dates, --ret-start/--ret-end, or --one-way", file=sys.stderr)
-        sys.exit(1)
-
-    # Build search pairs
-    if args.one_way:
-        pairs = [(od, None, 0) for od in out_dates]
-    else:
-        pairs = generate_date_pairs(out_dates, ret_dates, args.min_stay, args.max_stay)
-
-    trip_type = "one-way" if args.one_way else "round-trip"
-    print(f"Outbound dates: {len(out_dates)}")
-    if not args.one_way:
-        print(f"Return dates: {len(ret_dates)}")
-    print(f"Valid pairs ({trip_type}, stay {args.min_stay}-{args.max_stay}d): {len(pairs)}")
-
-    if not pairs:
-        print("No valid date pairs! Check date ranges and stay constraints.")
-        return
-
-    # For efficiency: instead of searching every pair individually,
-    # Google Flights RT search shows the TOTAL price for a specific pair.
-    # We need one search per pair. To reduce volume:
-    # 1. First pass: sample every 3rd pair to identify price landscape
-    # 2. Second pass: fill in around the cheapest combos
-    # But for now, let's just search all pairs (each takes ~10s)
+    out_target_dt = datetime.strptime(args.out_target, "%Y-%m-%d")
+    # Only target the outbound month the user specified — don't include adjacent months
+    # which can return cheaper dates outside the user's intended window
+    out_months = {out_target_dt.month}
+    airline_names = [a.strip() for a in args.airlines.split(",")]
 
     all_results = []
-    airlines_filter = set(a.strip() for a in args.airlines.split(",")) if args.airlines else None
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=not args.headed,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+            args=["--disable-blink-features=AutomationControlled","--no-sandbox"])
         ctx = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
+            viewport={"width":1920,"height":1080},
+            locale="en-US", timezone_id="America/Los_Angeles")
         ctx.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined})')
         page = ctx.new_page()
 
-        print(f"\n{'='*60}")
-        print(f"  {trip_type}: {args.origin} {'→' if args.one_way else '↔'} {args.dest} | {args.cabin}")
-        print(f"  {len(pairs)} searches | airlines: {airlines_filter or 'all'}")
-        print(f"{'='*60}\n")
+        # STEPS 1-4
+        print(f"STEPS 1-4: {args.origin}->{args.dest}, {args.cabin}, round-trip")
+        url = f"https://www.google.com/travel/flights?q=Flights+from+{args.origin}+to+{args.dest}+{args.cabin}+class"
+        page.goto(url, timeout=30000)
+        time.sleep(8)
 
-        for i, (out_date, ret_date, stay) in enumerate(pairs):
-            if args.one_way:
-                print(f"[{i+1}/{len(pairs)}] {out_date}...", end=" ", flush=True)
-            else:
-                print(f"[{i+1}/{len(pairs)}] {out_date} → {ret_date} ({stay}d)...", end=" ", flush=True)
+        # STEP 5
+        print("STEP 5: Opening departure calendar")
+        click_el(page, page.locator('input[placeholder="Departure"]').first)
+        time.sleep(3)
 
-            flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, args.debug,
-                                     filter_airlines=list(airlines_filter) if airlines_filter else None)
+        # STEPS 6-7: Navigate LEFT to outbound month
+        print(f"STEPS 6-7: Navigating to {MONTH_NAMES.get(out_target_dt.month)}")
+        time.sleep(3)
+        out_prices = navigate_back(page, out_months)
+        time.sleep(4)
+        out_prices.update(extract_calendar_prices(page, out_months))
+        print(f"  {len(out_prices)} outbound prices found")
 
-            # Filter to airlines of interest
-            if airlines_filter:
-                interesting = []
-                for f in flights:
-                    airline_lower = f["airline"].lower()
-                    if any(a.lower() in airline_lower for a in airlines_filter):
-                        interesting.append(f)
-            else:
-                interesting = flights
+        if not out_prices:
+            print("ERROR: No outbound prices!")
+            browser.close()
+            return
 
-            if interesting:
-                best = min(interesting, key=lambda x: x["total_price"])
-                print(f"{len(interesting)} matches, best: {best['airline']} ${best['total_price']:,}")
-            else:
-                print(f"{len(flights)} flights, 0 matches")
+        # STEP 8
+        top_out = sorted(out_prices.items(), key=lambda x: x[1])[:args.top_outbound]
+        print(f"STEP 8: Top {len(top_out)} cheapest:")
+        for d, pr in top_out:
+            print(f"  {d}: ${pr:,}")
 
-            for f in interesting:
-                all_results.append({
-                    "airline": f["airline"],
-                    "class": args.cabin,
-                    "outbound_date": out_date,
-                    "return_date": ret_date,
-                    "stay_days": stay,
-                    "out_departure": f["out_departure"],
-                    "out_arrival": f["out_arrival"],
-                    "out_duration": f["out_duration"],
-                    "out_stops": f["out_stops"],
-                    "ret_departure": f["ret_departure"],
-                    "ret_arrival": f["ret_arrival"],
-                    "ret_duration": f["ret_duration"],
-                    "ret_stops": f["ret_stops"],
-                    "total_price": f"${f['total_price']:,}",
-                    "total_price_num": f["total_price"],
-                    "search_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
+        # ITERATE outbound dates
+        for out_rank, (out_date, out_cal) in enumerate(top_out, 1):
+            out_dt = datetime.strptime(out_date, "%Y-%m-%d")
+            earliest_ret = out_dt + timedelta(days=args.min_stay)
+            latest_ret = out_dt + timedelta(days=args.max_stay)
+            ret_months = set()
+            d = earliest_ret
+            while d <= latest_ret:
+                ret_months.add(d.month)
+                d += timedelta(days=28)
 
-            # Delays
-            if (i + 1) % 10 == 0:
-                print("  (longer pause)")
-                human_delay(15, 30)
-            else:
-                human_delay(5, 10)
+            print(f"\n{'='*50}")
+            print(f"  #{out_rank}: {out_date} (${out_cal:,})")
+            print(f"{'='*50}")
+
+            # STEP 9: Click outbound
+            if not click_date(page, out_date):
+                print("  Could not click outbound, skipping")
+                click_el(page, page.locator('input[placeholder="Departure"]').first)
+                time.sleep(2)
+                navigate_back(page, out_months)
+                continue
+            time.sleep(3)
+
+            # STEPS 10-14: Return calendar
+            print(f"  Return: navigating to {[MONTH_NAMES.get(m) for m in sorted(ret_months)]}")
+            ret_prices = navigate_forward(page, ret_months)
+            time.sleep(4)
+            ret_prices.update(extract_calendar_prices(page, ret_months))
+
+            valid = {d_s: pr for d_s, pr in ret_prices.items()
+                     if args.min_stay <= (datetime.strptime(d_s, "%Y-%m-%d") - out_dt).days <= args.max_stay}
+
+            if not valid:
+                print(f"  No valid returns ({args.min_stay}-{args.max_stay}d)")
+                page.keyboard.press("Escape")
+                time.sleep(1)
+                click_el(page, page.locator('input[placeholder="Departure"]').first)
+                time.sleep(2)
+                navigate_back(page, out_months)
+                continue
+
+            top_rets = sorted(valid.items(), key=lambda x: x[1])[:3]
+            for d_s, pr in top_rets:
+                stay = (datetime.strptime(d_s, "%Y-%m-%d") - out_dt).days
+                print(f"  Return: {d_s} ({stay}d) ${pr:,}")
+
+            # STEPS 15-16: Click return + Done
+            ret_date = top_rets[0][0]
+            ret_stay = (datetime.strptime(ret_date, "%Y-%m-%d") - out_dt).days
+            click_date(page, ret_date)
+            time.sleep(2)
+            done = page.locator('button:has-text("Done")')
+            if done.count() > 0:
+                click_el(page, done)
+                time.sleep(2)
+            page.keyboard.press("Escape")
+            time.sleep(1)
+
+            # STEP 17: Search
+            search_btn = page.locator('button:has-text("Search")')
+            if search_btn.count() > 0:
+                click_el(page, search_btn)
+            time.sleep(10)
+
+            # STEPS 18-20: Airline filter
+            try:
+                btn = page.locator('button:has-text("Airlines"), button:has-text("All airlines")')
+                if btn.count() > 0:
+                    click_el(page, btn)
+                    time.sleep(2)
+                    toggle = page.locator('button[role="switch"][aria-label="Select all airlines"]')
+                    if toggle.count() > 0 and toggle.get_attribute("aria-checked") == "true":
+                        toggle.first.click(force=True)
+                        time.sleep(2)
+                    for name in airline_names:
+                        li = page.locator(f'li[ssk*="{name}"]')
+                        if li.count() > 0:
+                            li.first.click(force=True)
+                            time.sleep(0.5)
+                    page.keyboard.press("Escape")
+                    time.sleep(3)
+            except:
+                page.keyboard.press("Escape")
+
+            # STEP 21: Stops
+            try:
+                btn = page.locator('button:has-text("Stops")')
+                if btn.count() > 0:
+                    click_el(page, btn)
+                    time.sleep(1)
+                    el = page.locator(f'label:has-text("{args.max_stops}")')
+                    if el.count() > 0:
+                        click_el(page, el)
+                    page.keyboard.press("Escape")
+                    time.sleep(2)
+            except:
+                pass
+
+            # STEP 22: Extract
+            page.mouse.wheel(0, 500)
+            time.sleep(2)
+            try:
+                for txt in ["more flights", "View more", "Other flights"]:
+                    more = page.locator(f'button:has-text("{txt}")')
+                    if more.count() > 0:
+                        click_el(page, more)
+                        time.sleep(3)
+                        break
+            except:
+                pass
+
+            results = extract_results(page)
+            print(f"  {len(results)} flights")
+            for f in results[:5]:
+                print(f"    {f['airline']:<25s} ${f['price']:>7,}  {f['stops']}")
+                all_results.append(make_result_row(f, args.cabin, out_date, ret_date, ret_stay))
+
+            # STEPS 23-24: Date shifts
+            for shift in range(args.date_shifts):
+                try:
+                    arrows = page.locator('button[aria-label*="Later"], button[aria-label*="later"]')
+                    if arrows.count() > 0:
+                        click_el(page, arrows)
+                        time.sleep(6)
+                        shifted = extract_results(page)
+                        for f in shifted[:2]:
+                            all_results.append(make_result_row(f, args.cabin, f"shift+{shift+1}", ret_date, ret_stay))
+                    else:
+                        break
+                except:
+                    break
+
+            # Alt returns via direct URL
+            for alt_ret, _ in top_rets[1:]:
+                alt_stay = (datetime.strptime(alt_ret, "%Y-%m-%d") - out_dt).days
+                try:
+                    q = f"Flights from {args.origin} to {args.dest} on {out_date} returning {alt_ret} {args.cabin} class"
+                    page.goto(f"https://www.google.com/travel/flights?q={q.replace(' ','+')}", timeout=30000)
+                    time.sleep(8)
+                    for f in extract_results(page)[:3]:
+                        all_results.append(make_result_row(f, args.cabin, out_date, alt_ret, alt_stay))
+                except:
+                    pass
+
+            # Reset for next outbound
+            page.goto(url, timeout=30000)
+            time.sleep(8)
+            click_el(page, page.locator('input[placeholder="Departure"]').first)
+            time.sleep(3)
+            navigate_back(page, out_months)
+            time.sleep(3)
 
         browser.close()
 
-    # Sort by price
-    all_results.sort(key=lambda x: x["total_price_num"])
+    # STEPS 25-27
+    all_results.sort(key=lambda x: x.get("total_price_num", 99999))
 
-    # Save raw JSON
-    Path(json_path).write_text(json.dumps(all_results, indent=2, default=str))
-    print(f"\nJSON: {json_path}")
+    Path(str(DATA_DIR / f"{slug}_results.json")).write_text(json.dumps(all_results, indent=2, default=str))
 
-    # Write CSV
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    fields = [
-        "airline", "class", "outbound_date", "return_date", "stay_days",
-        "out_departure", "out_arrival", "out_duration", "out_stops",
-        "ret_departure", "ret_arrival", "ret_duration", "ret_stops",
-        "total_price", "search_date",
-    ]
-    # Also add out_price/ret_price as "N/A" for compatibility with report
-    for r in all_results:
-        r["out_flight"] = r["airline"]
-        r["ret_flight"] = r["airline"]
-        r["out_price"] = "RT"
-        r["ret_price"] = "RT"
-        r["out_price_num"] = r["total_price_num"] if args.one_way else r["total_price_num"] / 2
-        r["ret_price_num"] = 0 if args.one_way else r["total_price_num"] / 2
-
-    fields_full = [
-        "airline", "class", "outbound_date", "return_date", "stay_days",
-        "out_flight", "out_departure", "out_arrival", "out_duration", "out_stops", "out_price",
-        "ret_flight", "ret_departure", "ret_arrival", "ret_duration", "ret_stops", "ret_price",
-        "total_price", "search_date",
-    ]
+    fields = ["airline","class","outbound_date","return_date","stay_days",
+              "out_flight","out_departure","out_arrival","out_duration","out_stops","out_price",
+              "ret_flight","ret_departure","ret_arrival","ret_duration","ret_stops","ret_price",
+              "total_price","search_date"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields_full, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_results)
-    print(f"CSV: {csv_path} ({len(all_results)} rows)")
+    print(f"\nCSV: {csv_path} ({len(all_results)} rows)")
 
-    # Generate HTML report
     try:
         sys.path.insert(0, str(SCRIPTS_DIR))
         from generate_report import generate_report
         generate_report(csv_path, html_path)
     except Exception as e:
-        print(f"Report generation: {e}")
+        print(f"Report: {e}")
 
-    # Save timestamped copies for history
-    import shutil
-    shutil.copy2(csv_path, csv_history)
-    shutil.copy2(html_path, html_history)
-    print(f"History: {csv_history}")
+    shutil.copy2(csv_path, str(history_dir / f"{slug}-{ts}.csv"))
+    if os.path.exists(html_path):
+        shutil.copy2(html_path, str(history_dir / f"{slug}-{ts}.html"))
 
-    # Summary
     print(f"\n{'='*60}")
-    print(f"TOP 20 CHEAPEST {'ONE-WAY' if args.one_way else 'ROUND-TRIP'} FARES")
+    print(f"TOP 20")
     print(f"{'='*60}")
-    seen_combos = set()
+    seen = set()
     rank = 0
     for r in all_results:
-        key = (r["airline"], r["total_price_num"], r["outbound_date"], r.get("return_date", ""))
-        if key in seen_combos:
+        key = (r["airline"][:20], r.get("total_price_num",0), r["outbound_date"], r["return_date"])
+        if key in seen:
             continue
-        seen_combos.add(key)
+        seen.add(key)
         rank += 1
         if rank > 20:
             break
-        if args.one_way:
-            print(f"  {rank:2d}. {r['airline']:<25s} {r['total_price']:>8s}  "
-                  f"{r['outbound_date']}  {r['out_stops']}")
-        else:
-            print(f"  {rank:2d}. {r['airline']:<25s} {r['total_price']:>8s}  "
-                  f"{r['outbound_date']}→{r['return_date']} ({r['stay_days']}d)  "
-                  f"{r['out_stops']} / {r['ret_stops']}")
+        print(f"  {rank:2d}. {r['airline']:<25s} {r['total_price']:>8s}  {r['outbound_date']} -> {r['return_date']} ({r['stay_days']}d)")
 
 
 if __name__ == "__main__":

@@ -235,15 +235,34 @@ def main():
         time.sleep(3)
 
         # STEPS 6-7: Navigate LEFT to outbound month
-        print(f"STEPS 6-7: Navigating to {MONTH_NAMES.get(out_target_dt.month)}")
+        # Keep clicking LEFT until the EXACT target month has prices loaded
+        target_m = out_target_dt.month
+        print(f"STEPS 6-7: Navigating to {MONTH_NAMES.get(target_m)}")
         time.sleep(3)
-        out_prices = navigate_back(page, out_months)
-        time.sleep(4)
-        out_prices.update(extract_calendar_prices(page, out_months))
-        print(f"  {len(out_prices)} outbound prices found")
+        for nav_attempt in range(20):
+            out_prices = extract_calendar_prices(page, {target_m})
+            if out_prices:
+                break
+            prev = page.locator('button[aria-label="Previous"]')
+            if prev.count() > 0:
+                click_el(page, prev)
+                time.sleep(2)
+        # Extra wait for all prices to load
+        time.sleep(6)
+        out_prices.update(extract_calendar_prices(page, {target_m}))
+        print(f"  {len(out_prices)} outbound prices found for {MONTH_NAMES.get(target_m)}")
 
         if not out_prices:
             print("ERROR: No outbound prices!")
+            browser.close()
+            return
+
+        # Filter to target month only (adjacent months may have loaded too)
+        target_prefix = out_target_dt.strftime("%Y-%m")
+        out_prices = {d: p for d, p in out_prices.items() if d.startswith(target_prefix)}
+        print(f"  After filtering to {target_prefix}: {len(out_prices)} prices")
+        if not out_prices:
+            print("ERROR: No prices in target month!")
             browser.close()
             return
 
@@ -277,10 +296,18 @@ def main():
                 continue
             time.sleep(3)
 
-            # STEPS 10-14: Return calendar
-            print(f"  Return: navigating to {[MONTH_NAMES.get(m) for m in sorted(ret_months)]}")
-            ret_prices = navigate_forward(page, ret_months)
-            time.sleep(4)
+            # STEPS 10-14: Return calendar — navigate RIGHT to exact return month
+            primary_ret_m = min(ret_months)
+            print(f"  Return: navigating to {MONTH_NAMES.get(primary_ret_m)}")
+            for _nav in range(15):
+                ret_prices = extract_calendar_prices(page, {primary_ret_m})
+                if ret_prices:
+                    break
+                nxt = page.locator('button[aria-label="Next"]')
+                if nxt.count() > 0:
+                    click_el(page, nxt)
+                    time.sleep(2)
+            time.sleep(6)
             ret_prices.update(extract_calendar_prices(page, ret_months))
 
             valid = {d_s: pr for d_s, pr in ret_prices.items()

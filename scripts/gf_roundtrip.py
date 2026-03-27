@@ -76,10 +76,99 @@ def click_el(page, locator):
     return False
 
 
-def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=False, debug=False):
+def apply_airline_filter(page, airline_names):
+    """Click Airlines filter on Google Flights, select ONLY the specified airlines."""
+    try:
+        btn = page.locator('button:has-text("Airlines"), button:has-text("All airlines")')
+        if btn.count() == 0:
+            return False
+        click_el(page, btn)
+        human_delay(1, 2)
+
+        # Clear all selections first
+        for txt in ["Clear airline selections", "Reset"]:
+            try:
+                el = page.locator(f'a:has-text("{txt}"), button:has-text("{txt}"), span:has-text("{txt}")')
+                if el.count() > 0:
+                    click_el(page, el)
+                    human_delay(0.5, 1)
+                    break
+            except:
+                pass
+
+        # Select each target airline
+        for name in airline_names:
+            for sel in [f'label:has-text("{name}")', f'div[role="checkbox"]:has-text("{name}")', f'li:has-text("{name}")']:
+                try:
+                    el = page.locator(sel)
+                    if el.count() > 0:
+                        click_el(page, el)
+                        human_delay(0.3, 0.6)
+                        break
+                except:
+                    continue
+
+        # Close filter
+        human_delay(0.5, 1)
+        try:
+            close = page.locator('button:has-text("Close"), button[aria-label="Close"]')
+            if close.count() > 0:
+                click_el(page, close)
+            else:
+                page.keyboard.press("Escape")
+        except:
+            page.keyboard.press("Escape")
+        human_delay(2, 4)
+        return True
+    except:
+        try:
+            page.keyboard.press("Escape")
+        except:
+            pass
+        return False
+
+
+def apply_stops_filter(page, max_stops=1):
+    """Click Stops filter, select 1 stop or fewer."""
+    try:
+        btn = page.locator('button:has-text("Stops"), button:has-text("stops")')
+        if btn.count() == 0:
+            return
+        click_el(page, btn)
+        human_delay(0.5, 1)
+
+        if max_stops == 0:
+            target = page.locator('label:has-text("Nonstop only"), li:has-text("Nonstop only")')
+        else:
+            target = page.locator('label:has-text("1 stop or fewer"), li:has-text("1 stop or fewer")')
+        if target.count() > 0:
+            click_el(page, target)
+            human_delay(0.5, 1)
+
+        try:
+            close = page.locator('button:has-text("Close"), button[aria-label="Close"]')
+            if close.count() > 0:
+                click_el(page, close)
+            else:
+                page.keyboard.press("Escape")
+        except:
+            page.keyboard.press("Escape")
+        human_delay(1, 2)
+    except:
+        try:
+            page.keyboard.press("Escape")
+        except:
+            pass
+
+
+def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=False, debug=False,
+                     filter_airlines=None, max_stops=1):
     """
-    Search flights on Google Flights via natural language URL.
-    Returns list of result dicts.
+    Search flights on Google Flights:
+    1. Load URL with route + dates + class
+    2. Apply airline filter (ONLY show target airlines)
+    3. Apply stops filter (direct or 1 stop)
+    4. Extract filtered results
     """
     if one_way or not ret_date:
         q = f"Flights from {origin} to {dest} on {out_date} one way {cabin} class"
@@ -89,18 +178,29 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
     page.goto(url, timeout=30000)
     human_delay(5, 9)
 
-    # Scroll to load more
+    # STEP 1: Apply airline filter — forces Google to show only our airlines
+    if filter_airlines:
+        apply_airline_filter(page, filter_airlines)
+
+    # STEP 2: Apply stops filter
+    apply_stops_filter(page, max_stops)
+
+    # STEP 3: Scroll and expand to see all filtered results
     page.mouse.wheel(0, 500)
     human_delay(1, 2)
 
-    # Try to expand "Other flights"
     try:
-        more = page.locator('button:has-text("more flights"), button:has-text("Show more")')
-        if more.count() > 0:
-            click_el(page, more)
-            human_delay(2, 3)
+        for txt in ["more flights", "View more", "Other flights", "Show more"]:
+            more = page.locator(f'button:has-text("{txt}")')
+            if more.count() > 0:
+                click_el(page, more)
+                human_delay(2, 3)
+                break
     except:
         pass
+
+    page.mouse.wheel(0, 500)
+    human_delay(1, 2)
 
     results = []
 
@@ -108,7 +208,10 @@ def search_roundtrip(page, origin, dest, out_date, ret_date, cabin, one_way=Fals
     # Each result is a li with airline, times, duration, stops, and TOTAL price
     items = page.locator("li").all()
     for item in items:
-        text = item.inner_text().strip()
+        try:
+            text = item.inner_text(timeout=3000).strip()
+        except:
+            continue
         if not re.search(r"\$[\d,]+", text):
             continue
         if len(text) < 30 or len(text) > 800:
@@ -279,14 +382,15 @@ def main():
             else:
                 print(f"[{i+1}/{len(pairs)}] {out_date} → {ret_date} ({stay}d)...", end=" ", flush=True)
 
-            flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, args.debug)
+            flights = search_roundtrip(page, args.origin, args.dest, out_date, ret_date, args.cabin, args.one_way, args.debug,
+                                     filter_airlines=list(airlines_filter) if airlines_filter else None)
 
-            # Filter to airlines of interest — check PRIMARY airline (first one listed)
+            # Filter to airlines of interest
             if airlines_filter:
                 interesting = []
                 for f in flights:
-                    primary = f["airline"].split(",")[0].strip().lower()
-                    if any(a.lower() in primary for a in airlines_filter):
+                    airline_lower = f["airline"].lower()
+                    if any(a.lower() in airline_lower for a in airlines_filter):
                         interesting.append(f)
             else:
                 interesting = flights

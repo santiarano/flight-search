@@ -205,9 +205,10 @@ def main():
     html_path = args.html or str(VAULT_FLIGHTS / f"{slug}-report.html")
 
     out_target_dt = datetime.strptime(args.out_target, "%Y-%m-%d")
-    # Only target the outbound month the user specified — don't include adjacent months
-    # which can return cheaper dates outside the user's intended window
     out_months = {out_target_dt.month}
+    # Include adjacent month
+    if out_target_dt.month < 12:
+        out_months.add(out_target_dt.month + 1)
     airline_names = [a.strip() for a in args.airlines.split(",")]
 
     all_results = []
